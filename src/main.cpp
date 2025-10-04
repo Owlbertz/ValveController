@@ -19,19 +19,26 @@ const char *MQTT_TOPIC_VALVE2_STATE = "valvecontroller/valve2/state";
 const char *MQTT_TOPIC_VALVE1_COMMAND = "valvecontroller/valve1/command";
 const char *MQTT_TOPIC_VALVE2_COMMAND = "valvecontroller/valve2/command";
 const char *MQTT_TOPIC_FLOW_RATE = "valvecontroller/flow_rate";
+const char *MQTT_TOPIC_TOTAL_REVOLUTIONS = "valvecontroller/total_revolutions";
+const char *MQTT_TOPIC_TOTAL_LITRES = "valvecontroller/total_litres";
 const char *MQTT_TOPIC_IS_FLOWING = "valvecontroller/is_flowing";
 const char *MQTT_TOPIC_ERROR = "valvecontroller/error";
 const char *MQTT_CLIENT_NAME = "valvecontroller";
 
-const long FLOW_SENSOR_MEASUREMENT_INTERVAL = 1000;
+const long FLOW_SENSOR_MEASUREMENT_INTERVAL_IN_MS = 1000;
 const long FLOW_SENSOR_PUBLISH_INTERVAL = 1000 * 10;
+// 1 litre = 64 revolutions
+const long FLOW_SENSOR_TOTAL_REVOLUTIONS_PER_LITRE = 64;
+
 long flowSensorLastPublish = 0;
 long flowSensorLastReading = 0;
 bool isFlowing = false;
 volatile int flowRateSensorInterruptCount = 0; // Measuring the rising edges of the signal
+unsigned long totalFlow = 0;
 float flowRatePerMinute = 0;
-float flowRateUnitPerPulse = 1;
 float flowRatePerMinuteLastPublished = 0;
+unsigned long flowSensorTotalRevolutions = 0;
+unsigned long flowSensorTotalRevolutionsLastPublished = 0;
 
 const int VALVE_CLOSE = HIGH;
 const int VALVE_OPEN = LOW;
@@ -40,7 +47,7 @@ const bool wifiEnabled = true;
 
 AsyncWebServer webServer(80); // AsyncWebServer  on port 80
 
-const long GLOBAL_DELAY = 150;
+const long GLOBAL_DELAY = 100;
 
 const int VALVE_1_PIN = 21;
 const int VALVE_2_PIN = 19;
@@ -194,6 +201,9 @@ void setupApiServer()
     root["flow_rate"] = flowRatePerMinute;
     root["flow_rate_unit"] = "l/min";
     root["is_flowing"] = isFlowing;
+    root["total_revolutions"] = flowSensorTotalRevolutions;
+    root["total_litres"] = flowSensorTotalRevolutions / FLOW_SENSOR_TOTAL_REVOLUTIONS_PER_LITRE;
+    root["millis"] = millis();
     serializeJson(root, *response);
     request->send(response); });
 
@@ -276,7 +286,7 @@ void setupFlowRateSensor()
 
 void readFlowRateSensor()
 {
-  if (millis() - flowSensorLastReading < FLOW_SENSOR_MEASUREMENT_INTERVAL)
+  if (millis() - flowSensorLastReading < FLOW_SENSOR_MEASUREMENT_INTERVAL_IN_MS)
   {
     return;
   }
@@ -284,8 +294,9 @@ void readFlowRateSensor()
   // Serial.println("flowRateSensorInterruptCount: " + (String)flowRateSensorInterruptCount);
 
   noInterrupts();
-  float flowRatePerHour = (flowRateSensorInterruptCount * 60) / flowRateUnitPerPulse; //(Pulse frequency x 60) / Q, = flow rate in L/hour
-  flowRatePerMinute = flowRatePerHour / 60;
+  float flowRatePerInterval = flowRateSensorInterruptCount / FLOW_SENSOR_TOTAL_REVOLUTIONS_PER_LITRE;
+  flowRatePerMinute = flowRatePerInterval * ((60 * 1000) / FLOW_SENSOR_MEASUREMENT_INTERVAL_IN_MS);
+  flowSensorTotalRevolutions += flowRateSensorInterruptCount;
   flowRateSensorInterruptCount = 0;
   interrupts();
 
@@ -301,14 +312,47 @@ void readFlowRateSensor()
   {
     if (abs(flowRatePerMinute - flowRatePerMinuteLastPublished) > 0.1)
     {
-      Serial.println("Current flow rate: " + (String)flowRatePerMinute + " l/min, is flowing: " + (isFlowing ? "true" : "false"));
-      char result[8];
-      dtostrf(flowRatePerMinute, 2, 2, result);
+      try
+      {
+        Serial.println("Current flow rate: " + (String)flowRatePerMinute + " l/min, is flowing: " + (isFlowing ? "true" : "false"));
+        char result[8];
+        dtostrf(flowRatePerMinute, 2, 2, result);
 
-      mqttClient.publish(MQTT_TOPIC_FLOW_RATE, result);
-      mqttClient.publish(MQTT_TOPIC_IS_FLOWING, isFlowing ? "true" : "false");
-      Serial.println("Publishing: " + String(result) + " l/min, is flowing: " + (isFlowing ? "true" : "false"));
-      flowRatePerMinuteLastPublished = flowRatePerMinute;
+        mqttClient.publish(MQTT_TOPIC_FLOW_RATE, result);
+        mqttClient.publish(MQTT_TOPIC_IS_FLOWING, isFlowing ? "true" : "false");
+        Serial.println("Publishing: " + String(result) + " l/min, is flowing: " + (isFlowing ? "true" : "false"));
+        flowRatePerMinuteLastPublished = flowRatePerMinute;
+      }
+      catch (...)
+      {
+        Serial.println("Error publishing flow rate");
+        mqttClient.publish(MQTT_TOPIC_ERROR, "Error publishing flow rate");
+      }
+    }
+    if (abs((long)(flowSensorTotalRevolutions - flowSensorTotalRevolutionsLastPublished)) >= 1)
+    {
+      try
+      {
+        Serial.println("Total revolutions: " + (String)flowSensorTotalRevolutions);
+        long totalLitres = flowSensorTotalRevolutions / FLOW_SENSOR_TOTAL_REVOLUTIONS_PER_LITRE;
+        Serial.println("Total litres: " + (String)totalLitres);
+
+        char revolutionsResult[8];
+        sprintf(revolutionsResult, "%lu", flowSensorTotalRevolutions);
+        char litresResult[8];
+        sprintf(litresResult, "%lu", totalLitres);
+
+        mqttClient.publish(MQTT_TOPIC_TOTAL_REVOLUTIONS, revolutionsResult);
+        Serial.println("Publishing total revolutions: " + String(revolutionsResult));
+        mqttClient.publish(MQTT_TOPIC_TOTAL_LITRES, litresResult);
+        Serial.println("Publishing total litres: " + String(litresResult));
+        flowSensorTotalRevolutionsLastPublished = flowSensorTotalRevolutions;
+      }
+      catch (...)
+      {
+        Serial.println("Error publishing total revolutions/litres");
+        mqttClient.publish(MQTT_TOPIC_ERROR, "Error publishing revolutions/litres");
+      }
     }
     flowSensorLastPublish = millis();
   }
@@ -362,6 +406,10 @@ void loop()
 
     if (isFirstRun)
     {
+      mqttClient.publish(MQTT_TOPIC_ERROR, "Started");
+
+      delay(500);
+
       mqttClient.publish(MQTT_TOPIC_ERROR, "No error");
 
       toggleValve1(false);
@@ -369,6 +417,8 @@ void loop()
 
       mqttClient.publish(MQTT_TOPIC_FLOW_RATE, "0.00");
       mqttClient.publish(MQTT_TOPIC_IS_FLOWING, "false");
+      mqttClient.publish(MQTT_TOPIC_TOTAL_REVOLUTIONS, "0");
+      mqttClient.publish(MQTT_TOPIC_TOTAL_LITRES, "0");
 
       isFirstRun = false;
     }
